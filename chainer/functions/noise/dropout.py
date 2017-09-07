@@ -3,14 +3,30 @@ import numpy
 import chainer
 from chainer import configuration
 from chainer import cuda
-from chainer import function
+from chainer import function_node
 from chainer.utils import argument
 from chainer.utils import type_check
 
 
-class Dropout(function.Function):
+if cuda.cudnn_enabled:
+    cudnn = cuda.cudnn
+    libcudnn = cuda.cudnn.cudnn
+
+
+def _as4darray(arr):
+    if arr.ndim == 0:
+        return arr.reshape(1, 1, 1, 1)
+    elif arr.ndim == 4:
+        return arr
+    else:
+        return arr.reshape(arr.shape[0], -1, 1, 1)
+
+
+class Dropout(function_node.FunctionNode):
 
     """Dropout regularization."""
+
+    _use_cudnn = False
 
     def __init__(self, dropout_ratio):
         if not 0.0 <= dropout_ratio < 1.0:
@@ -21,19 +37,46 @@ class Dropout(function.Function):
         type_check.expect(in_types.size() == 1)
         type_check.expect(in_types[0].dtype.kind == 'f')
 
-    def forward(self, x):
-        self.retain_inputs(())
+    def forward_cpu(self, x):
         if hasattr(self, 'mask'):
             y = x[0] * self.mask
         else:
             scale = x[0].dtype.type(1. / (1 - self.dropout_ratio))
-            xp = cuda.get_array_module(*x)
-            if xp == numpy:
-                flag = xp.random.rand(*x[0].shape) >= self.dropout_ratio
-                self.mask = scale * flag
+            flag = numpy.random.rand(*x[0].shape) >= self.dropout_ratio
+            self.mask = scale * flag
+            y = x[0] * self.mask
+        return y,
+
+    def forward_gpu(self, x):
+        if chainer.should_use_cudnn('==always', 5000) and x[0].flags.c_contiguous:
+            from chainer.functions.connection.n_step_rnn import get_random_state
+
+            self._use_cudnn = True
+
+            x = cuda.cupy.ascontiguousarray(x[0])
+            y = cuda.cupy.empty_like(x)
+            # dtype = 'd' if x.dtype == 'd' else 'f'
+            handle = cudnn.get_handle()
+
+            x_mat = _as4darray(x)
+            x_desc = cudnn.create_tensor_descriptor(x_mat)
+
+            reserve_size = libcudnn.getDropoutReserveSpaceSize(x_desc.value)
+            self.reserve_space = cuda.cupy.empty((reserve_size,), dtype=x.dtype)
+            self.states = get_random_state().create_dropout_states(self.dropout_ratio)
+
+            # y must be same shape as x, so use x_desc instead of y_desc
+            libcudnn.dropoutForward(handle, self.states.desc.value,
+                                    x_desc.value, x_mat.data.ptr,
+                                    x_desc.value, y.data.ptr,
+                                    self.reserve_space.data.ptr, reserve_size)
+            return y,
+        else:
+            if hasattr(self, 'mask'):
                 y = x[0] * self.mask
             else:
-                rand = xp.random.rand(*x[0].shape, dtype=numpy.float32)
+                scale = x[0].dtype.type(1. / (1 - self.dropout_ratio))
+                rand = cuda.cupy.random.rand(*x[0].shape, dtype=numpy.float32)
                 self.mask, y = cuda.elementwise(
                     'T x, R r, T scale, T ratio', 'T mask, T y',
                     '''
@@ -44,8 +87,23 @@ class Dropout(function.Function):
                 )(x[0], rand, scale, self.dropout_ratio)
         return y,
 
-    def backward(self, x, gy):
-        return gy[0] * self.mask,
+    def backward(self, indexes, gy):
+        if chainer.should_use_cudnn('==always', 5000) and self._use_cudnn:
+            dy = cuda.cupy.ascontiguousarray(gy[0])
+            dx = cuda.cupy.empty_like(dy)
+            handle = cudnn.get_handle()
+
+            dy_mat = _as4darray(dy)
+            dy_desc = cudnn.create_tensor_descriptor(dy_mat)
+
+            # y must be same shape as x, so use x_desc instead of y_desc
+            libcudnn.dropoutBackward(handle, self.states.desc.value,
+                                     dy_desc.value, dy_mat.data.ptr,
+                                     dy_desc.value, dx.data.ptr,
+                                     self.reserve_space.data.ptr, self.reserve_space.size)
+            return dx
+        else:
+            return gy[0] * self.mask,
 
 
 def dropout(x, ratio=.5, **kwargs):
@@ -81,5 +139,6 @@ def dropout(x, ratio=.5, **kwargs):
     argument.assert_kwargs_empty(kwargs)
 
     if configuration.config.train:
-        return Dropout(ratio)(x)
+        y, = Dropout(ratio).apply((x,))
+        return y
     return chainer.as_variable(x)
