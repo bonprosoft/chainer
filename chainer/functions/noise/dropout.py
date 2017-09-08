@@ -89,7 +89,30 @@ class Dropout(function_node.FunctionNode):
 
     def backward(self, indexes, gy):
         if chainer.should_use_cudnn('==always', 5000) and self._use_cudnn:
-            dy = cuda.cupy.ascontiguousarray(gy[0])
+            return DropoutGrad(self.states, self.reserve_space).apply((gy[0],))
+        else:
+            return DropoutGrad(self.mask).apply((gy[0],))
+
+
+class DropoutGrad(function_node.FunctionNode):
+
+    def __init__(self, *args):
+        super(DropoutGrad, self).__init__()
+        if len(args) == 1:
+            self._use_cudnn = False
+            self.mask, = args
+        elif len(args) == 2:
+            self._use_cudnn = True
+            self.states, self.reserve_space = args
+        else:
+            raise ValueError('length of argument must be 1 or 2')
+
+    def forward_cpu(self, inputs):
+        return inputs[0] * self.mask,
+
+    def forward_gpu(self, inputs):
+        if chainer.should_use_cudnn('==always', 5000) and self._use_cudnn:
+            dy = cuda.cupy.ascontiguousarray(inputs[0])
             dx = cuda.cupy.empty_like(dy)
             handle = cudnn.get_handle()
 
@@ -101,9 +124,16 @@ class Dropout(function_node.FunctionNode):
                                      dy_desc.value, dy_mat.data.ptr,
                                      dy_desc.value, dx.data.ptr,
                                      self.reserve_space.data.ptr, self.reserve_space.size)
-            return dx
+
+            return dx,
         else:
-            return gy[0] * self.mask,
+            return inputs[0] * self.mask,
+
+    def backward(self, indexes, gy):
+        if chainer.should_use_cudnn('==always', 5000) and self._use_cudnn:
+            return DropoutGrad(self.states, self.reserve_space).apply((gy[0],))
+        else:
+            return DropoutGrad(self.mask).apply((gy[0],))
 
 
 def dropout(x, ratio=.5, **kwargs):
